@@ -5,6 +5,10 @@ const http = require("node:http");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+
+global.DOMMatrix ||= class DOMMatrix {};
+global.Path2D ||= class Path2D {};
+
 const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
 
 const { extractDocument } = require("./src/extractor");
@@ -16,6 +20,7 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DOCUMENTS_DIR = path.join(DATA_DIR, "documents");
 const DB_PATH = path.join(DATA_DIR, "documents.json");
+const STANDARD_FONT_DATA_URL = path.join(ROOT, "node_modules", "pdfjs-dist", "standard_fonts") + path.sep;
 const PORT = Number(process.env.PORT || 3000);
 const PDFTOPPM =
   process.env.PDFTOPPM_PATH ||
@@ -139,7 +144,12 @@ async function renderPages(pdfPath, docDir) {
 
 async function extractSelectableTextPages(pdfPath, renderedPages) {
   const data = new Uint8Array(await fsp.readFile(pdfPath));
-  const pdf = await pdfjsLib.getDocument({ data, disableFontFace: true }).promise;
+  const pdf = await pdfjsLib.getDocument({
+    data,
+    disableFontFace: true,
+    standardFontDataUrl: STANDARD_FONT_DATA_URL,
+    verbosity: pdfjsLib.VerbosityLevel.ERRORS
+  }).promise;
   const pages = [];
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
