@@ -93,6 +93,8 @@ PDFTOPPM_PATH=/path/to/pdftoppm npm start
 - **OCR-first extraction:** the sample PDF is image-based, so text-only PDF extraction is not sufficient.
 - **Shared extraction schema:** field definitions live in one place, making requested field changes straightforward.
 - **Evidence-oriented UI:** extracted fields carry source text, confidence, page number, and highlight boxes so non-technical users can review quickly.
+- **Word-box highlights:** OCR word positions are grouped into lines and reused for both extraction and click-to-highlight behavior.
+- **Region-based party extraction:** shipper and consignee fields use deterministic page regions before falling back to global text order, which is more reliable on multi-column forms.
 
 ## Assumptions
 
@@ -111,6 +113,7 @@ PDFTOPPM_PATH=/path/to/pdftoppm npm start
 - Add per-field manual correction and reviewer approval state.
 - Add document-type classification before extraction.
 - Add table-aware line item extraction.
+- Add more fixture PDFs for invoices, packing lists, and bills of lading so extraction changes can be tested quickly.
 - Add an LLM or document AI fallback for low-confidence fields.
 - Add automated tests with fixture PDFs.
 - Add authentication and organization-level document isolation.
