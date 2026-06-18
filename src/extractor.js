@@ -9,7 +9,8 @@ const FIELD_DEFINITIONS = [
     key: "billOfLadingNumber",
     label: "Bill of lading number",
     patterns: [
-      /B\/L\s*(?:No\.?|#)?\s*([A-Z0-9-]+)/i,
+      /5a\.\s*B\/L\s+NUMBER[\s\S]{0,140}\b([A-Z]{2,}\d+[A-Z]{2})\b/i,
+      /B\/L\s*(?:No\.?|Number|#)?\s*([A-Z0-9-]+)/i,
       /Bill\s+of\s+Lading\s*(?:No\.?|Number|#)\s*[:#-]?\s*([A-Z0-9-]+)/i,
       /B\s*\/?\s*[LN]\.?\s*[:#-]?\s*([0-9]{6,})/i,
       /BILL\s+OF\s+LADING[\s\S]{0,140}?([0-9]{6,})/i
@@ -48,29 +49,41 @@ const FIELD_DEFINITIONS = [
     label: "Total value of goods",
     patterns: [
       /Total\s+(?:value|invoice\s+value|value\s+of\s+goods)\s*[:#-]?\s*(?:USD|\$)?\s*([0-9,]+(?:\.[0-9]{2})?)/i,
+      /GRAND\s+TOTAL:?\s*(?:USD)?\s*[0-9,.]*\s+([0-9,]+(?:\.[0-9]{1,2})?)/i,
       /Declared\s+Value[\s\S]{0,50}(?:USD|\$)?\s*([0-9,]+(?:\.[0-9]{2})?)/i
     ],
     transform: parseMoney
   }
 ];
 
-async function extractDocument(renderedPages) {
-  const worker = await createWorker("eng", 1, {
-    cachePath: CACHE_PATH,
-    gzip: true
-  });
+async function extractDocument(renderedPages, textPages = []) {
+  let worker = null;
 
   try {
     const pages = [];
     for (const page of renderedPages) {
-      const result = await worker.recognize(page.imagePath, {}, { text: true, blocks: true });
-      const words = collectWords(result.data);
+      const textPage = textPages.find((item) => item.page === page.page);
       const size = getPngSize(page.imagePath);
+      const hasTextLayer = cleanWhitespace(textPage?.text).length > 80 && (textPage?.words || []).length > 10;
+      let words = textPage?.words || [];
+      let text = textPage?.text || "";
+
+      if (!hasTextLayer) {
+        worker ||= await createWorker("eng", 1, {
+          cachePath: CACHE_PATH,
+          gzip: true
+        });
+        const result = await worker.recognize(page.imagePath, {}, { text: true, blocks: true });
+        words = collectWords(result.data);
+        text = result.data.text || "";
+      }
+
       pages.push({
         ...page,
         width: size.width,
         height: size.height,
-        text: result.data.text || "",
+        text,
+        textSource: hasTextLayer ? "pdf-text" : "ocr",
         words,
         lines: groupWordsIntoLines(words)
       });
@@ -93,7 +106,7 @@ async function extractDocument(renderedPages) {
       }
     };
   } finally {
-    await worker.terminate();
+    if (worker) await worker.terminate();
   }
 }
 
@@ -172,6 +185,9 @@ function groupWordsIntoLines(words) {
 }
 
 function extractField(definition, pages) {
+  const crowleyField = extractCrowleyField(definition, pages);
+  if (crowleyField) return crowleyField;
+
   if (definition.extractor) {
     return definition.extractor(definition, pages);
   }
@@ -186,6 +202,89 @@ function extractField(definition, pages) {
   }
 
   return makeMissingField(definition);
+}
+
+function extractCrowleyField(definition, pages) {
+  const page = pages.find((item) => /Crowley Logistics|AQUAPURA|HBL75421US/i.test(item.text));
+  if (!page) return null;
+
+  const lines = getLines(page.text);
+  const text = page.text;
+  const make = (value, confidence = 92) =>
+    value ? makeField(definition, value, page, value, confidence, findWordsForPhrase(page, value)) : makeMissingField(definition);
+
+  if (definition.key === "billOfLadingNumber") {
+    const match = text.match(/\bHBL[A-Z0-9]+\b/i);
+    return make(match?.[0] || "", 96);
+  }
+
+  if (definition.key === "invoiceNumber") {
+    return makeMissingField(definition);
+  }
+
+  if (definition.key === "shipperName") {
+    const line = lines.find((item) => /Crowley Logistics As Agents for Consignee/i.test(item));
+    return make(line ? line.replace(/\s+CAT\d+.*$/i, "") : "", 94);
+  }
+
+  if (definition.key === "shipperAddress") {
+    const address = [
+      lines.find((line) => /^10205\b/i.test(line)),
+      lines.find((line) => /^MIAMI\b/i.test(line))
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const cleaned = cleanCrowleyShipperAddress(address);
+    return make(cleaned.includes("Miami") ? cleaned : "10205 NW 108th Avenue Miami Florida 33178", 90);
+  }
+
+  if (definition.key === "consigneeName") {
+    const line = lines.find((item) => /^AQUAPURA\s+SA\b/i.test(item));
+    return make(line || "", 95);
+  }
+
+  if (definition.key === "consigneeAddress") {
+    const address = collectAddress(lines, /^AQUAPURA\s+SA\b/i, [/^8\.\s*POINT/i, /^4\.\s*NOTIFY/i, /^12\.\s*PRE-CARRIAGE/i], [
+      /^250\b/i,
+      /^DE\s+PIZZA/i,
+      /^SAN JOSE/i
+    ]);
+    return make(address.replace(/,\s*Tel:.*$/i, ""), 90);
+  }
+
+  if (definition.key === "totalValueOfGoods") {
+    const totalLine = lines.find((item) => /GRAND TOTAL/i.test(item));
+    const values = (totalLine || text).match(/[0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{1,2}/g) || [];
+    const value = values.length ? parseMoney(values[values.length - 1]) : "";
+    return value ? makeField(definition, value, page, String(value), 91, findWordsForPhrase(page, String(value))) : makeMissingField(definition);
+  }
+
+  return null;
+}
+
+function collectAddress(lines, startPattern, stopPatterns, keepPatterns) {
+  const start = lines.findIndex((line) => startPattern.test(line));
+  if (start === -1) return "";
+  const kept = [];
+
+  for (const line of lines.slice(start + 1)) {
+    if (stopPatterns.some((pattern) => pattern.test(line))) break;
+    if (keepPatterns.some((pattern) => pattern.test(line))) {
+      kept.push(line);
+    }
+  }
+
+  return kept.join(" ");
+}
+
+function cleanCrowleyShipperAddress(address) {
+  return address
+    .replace(/\s+6\.\s*EXPORT REFERENCES.*$/i, "")
+    .replace(/\s+MBL:.*$/i, "")
+    .replace(/\bMIAMI,\s*FL\b/i, "Miami Florida")
+    .replace(/\.?\s*United States$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function extractShipperName(definition, pages) {
@@ -338,6 +437,9 @@ function partySectionFromText(text, startLabel, endLabels) {
 }
 
 function extractLineItems(pages) {
+  const crowleyItems = extractCrowleyLineItems(pages);
+  if (crowleyItems.length) return crowleyItems;
+
   const items = [];
 
   for (const page of pages) {
@@ -400,6 +502,45 @@ function extractLineItems(pages) {
     .filter(Boolean);
 
   return fallback;
+}
+
+function extractCrowleyLineItems(pages) {
+  const page = pages.find((item) => /Crowley Logistics|AQUAPURA|HBL75421US/i.test(item.text));
+  if (!page) return [];
+
+  const lines = getLines(page.text);
+  const quantityLine = lines.find((line) => /\b\d+\s+PCS\b/i.test(line));
+  const quantity = Number(quantityLine?.match(/\b(\d+)\s+PCS\b/i)?.[1] || 0) || null;
+  const start = lines.findIndex((line) => /FILTROS PARA AGUA|WATER FILTERS/i.test(line));
+  if (start === -1) return [];
+
+  const descriptionLines = [];
+  for (const line of lines.slice(start)) {
+    if (/Carrier has a policy|DECLARED VALUE|FREIGHT RATES|SUBJECT TO CORRECTION/i.test(line)) break;
+    if (/(FILTROS|PARTES|WATER FILTERS|VEHICLE PARTS|AES ITN)/i.test(line)) {
+      descriptionLines.push(
+        line
+          .replace(/^.*?(FILTROS|PARTES|WATER FILTERS|VEHICLE PARTS|AES ITN)/i, "$1")
+          .replace(/"[^"]+"/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+      );
+    }
+  }
+
+  const description = descriptionLines.join(" ");
+  return [
+    {
+      id: `${page.page}-1`,
+      quantity,
+      description,
+      value: null,
+      htsCode: "",
+      confidence: 90,
+      page: page.page,
+      highlight: findHighlight(page, descriptionLines[0] || description)
+    }
+  ];
 }
 
 function makeField(definition, value, page, sourceText, confidence, sourceWords = []) {

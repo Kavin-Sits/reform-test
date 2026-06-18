@@ -5,6 +5,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
 
 const { extractDocument } = require("./src/extractor");
 
@@ -136,6 +137,90 @@ async function renderPages(pdfPath, docDir) {
   }));
 }
 
+async function extractSelectableTextPages(pdfPath, renderedPages) {
+  const data = new Uint8Array(await fsp.readFile(pdfPath));
+  const pdf = await pdfjsLib.getDocument({ data, disableFontFace: true }).promise;
+  const pages = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+    const pdfPage = await pdf.getPage(pageNumber);
+    const viewport = pdfPage.getViewport({ scale: 1 });
+    const rendered = renderedPages.find((page) => page.page === pageNumber);
+    const pngSize = rendered ? readPngSize(rendered.imagePath) : null;
+    const scale = pngSize ? pngSize.width / viewport.width : 1;
+    const content = await pdfPage.getTextContent();
+    const words = [];
+
+    for (const item of content.items) {
+      const text = cleanText(item.str);
+      if (!text) continue;
+
+      const x = item.transform[4] * scale;
+      const fontY = item.transform[5];
+      const height = Math.max(8, item.height || 10) * scale;
+      const y = (viewport.height - fontY - (item.height || 10)) * scale;
+      const width = Math.max(text.length * 4, item.width || 0) * scale;
+      const parts = text.split(/\s+/).filter(Boolean);
+      const totalChars = parts.reduce((sum, part) => sum + part.length, 0) || 1;
+      let cursor = x;
+
+      for (const part of parts) {
+        const partWidth = Math.max(4, width * (part.length / totalChars));
+        words.push({
+          text: part,
+          confidence: 100,
+          x: cursor,
+          y,
+          width: partWidth,
+          height
+        });
+        cursor += partWidth + Math.max(2, width * 0.03);
+      }
+    }
+
+    pages.push({
+      page: pageNumber,
+      text: wordsToLines(words),
+      words
+    });
+  }
+
+  return pages;
+}
+
+function readPngSize(imagePath) {
+  const buffer = fs.readFileSync(imagePath);
+  if (buffer.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") return null;
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20)
+  };
+}
+
+function wordsToLines(words) {
+  const lines = [];
+  for (const word of [...words].sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const centerY = word.y + word.height / 2;
+    let line = lines.find((candidate) => Math.abs(candidate.centerY - centerY) < Math.max(5, word.height * 0.65));
+    if (!line) {
+      line = { centerY, words: [] };
+      lines.push(line);
+    }
+    line.words.push(word);
+    line.centerY = line.words.reduce((sum, item) => sum + item.y + item.height / 2, 0) / line.words.length;
+  }
+
+  return lines
+    .map((line) => line.words.sort((a, b) => a.x - b.x).map((word) => word.text).join(" "))
+    .map(cleanText)
+    .filter(Boolean)
+    .join("\n");
+}
+
+function cleanText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
 function publicDocument(doc) {
   return {
     id: doc.id,
@@ -185,7 +270,8 @@ async function handleUpload(req, res) {
 
   try {
     const renderedPages = await renderPages(pdfPath, docDir);
-    const extraction = await extractDocument(renderedPages);
+    const textPages = await extractSelectableTextPages(pdfPath, renderedPages);
+    const extraction = await extractDocument(renderedPages, textPages);
     doc = {
       ...doc,
       status: "ready",
@@ -220,6 +306,20 @@ async function handleApi(req, res) {
 
   if (req.method === "POST" && url.pathname === "/api/documents") {
     await handleUpload(req, res);
+    return;
+  }
+
+  const deleteMatch = url.pathname.match(/^\/api\/documents\/([^/]+)$/);
+  if (req.method === "DELETE" && deleteMatch) {
+    const doc = documents.find((item) => item.id === deleteMatch[1]);
+    if (!doc) {
+      sendText(res, 404, "Not found");
+      return;
+    }
+
+    await fsp.rm(path.join(DOCUMENTS_DIR, doc.id), { recursive: true, force: true });
+    await writeDb(documents.filter((item) => item.id !== doc.id));
+    sendJson(res, 200, { ok: true });
     return;
   }
 

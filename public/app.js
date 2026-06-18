@@ -49,6 +49,22 @@ async function uploadFile(file) {
   }
 }
 
+async function deleteDocument(id) {
+  const response = await fetch(`/api/documents/${id}`, { method: "DELETE" });
+  if (!response.ok) {
+    elements.uploadStatus.textContent = "Delete failed";
+    return;
+  }
+
+  state.documents = state.documents.filter((doc) => doc.id !== id);
+  if (state.activeId === id) {
+    state.activeId = state.documents[0]?.id || null;
+    state.activeHighlight = null;
+  }
+  elements.uploadStatus.textContent = "Removed";
+  render();
+}
+
 function render() {
   const active = state.documents.find((doc) => doc.id === state.activeId);
   renderDocumentList();
@@ -67,10 +83,18 @@ function renderDocumentList() {
     const button = document.createElement("button");
     button.className = `document-button ${doc.id === state.activeId ? "active" : ""}`;
     button.innerHTML = `
-      <span class="document-name">${escapeHtml(doc.fileName)}</span>
+      <span class="document-row">
+        <span class="document-name">${escapeHtml(doc.fileName)}</span>
+        <span class="remove-document" title="Remove uploaded file">Remove</span>
+      </span>
       <span class="document-meta">${formatDate(doc.uploadedAt)} · ${escapeHtml(doc.status)}</span>
     `;
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async (event) => {
+      if (event.target.classList.contains("remove-document")) {
+        event.stopPropagation();
+        await deleteDocument(doc.id);
+        return;
+      }
       state.activeId = doc.id;
       state.activeHighlight = null;
       render();

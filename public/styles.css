@@ -149,6 +149,20 @@ h2 {
   font-weight: 700;
 }
 
+.document-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.remove-document {
+  flex: 0 0 auto;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .document-meta,
 .field-source,
 .empty-note {
