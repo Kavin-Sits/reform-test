@@ -225,11 +225,27 @@ h2 {
 .page-shell img {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
+  object-fit: contain;
+}
+
+.text-overlay {
+  position: absolute;
+  z-index: 1;
+  overflow: hidden;
+  padding: 1px 3px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #1f2933;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.15;
+  pointer-events: none;
+  overflow-wrap: anywhere;
 }
 
 .highlight {
   position: absolute;
+  z-index: 2;
   border: 2px solid var(--accent);
   background: var(--highlight);
   opacity: 0;

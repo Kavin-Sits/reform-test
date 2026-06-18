@@ -240,7 +240,7 @@ function publicDocument(doc) {
     summary: doc.summary,
     fields: doc.fields,
     lineItems: doc.lineItems,
-    pages: doc.pages.map(({ page, imageUrl, width, height }) => ({ page, imageUrl, width, height })),
+    pages: doc.pages.map(({ page, imageUrl, width, height, textSource }) => ({ page, imageUrl, width, height, textSource })),
     pdfUrl: `/api/documents/${doc.id}/file`
   };
 }

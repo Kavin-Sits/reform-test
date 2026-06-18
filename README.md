@@ -50,11 +50,28 @@ Key decisions:
 
 - Use a plain Node server to keep the prototype small and easy to run.
 - Store uploaded PDFs, rendered page images, and document metadata locally under `data/`.
-- Extract selectable PDF text with `pdfjs-dist` when available, then fall back to OCR with `tesseract.js` for scanned PDFs.
 - Render PDF pages to PNG and overlay extracted-field highlights in the browser.
 - Keep field extraction centralized in `src/extractor.js` so new document-specific rules do not spread through the UI.
 - Use confidence scores to make uncertain or missing values visible to reviewers.
 - Support deleting uploaded files through the UI and `DELETE /api/documents/:id`.
+
+Text extraction pipeline:
+
+```text
+PDF upload
+  -> render pages to PNG with Poppler
+  -> extract selectable text with pdfjs-dist
+  -> fall back to OCR with tesseract.js when selectable text is weak or missing
+  -> normalize both sources into the same page/word/line model
+  -> run field extractors against the normalized model
+  -> return values, confidence scores, and highlight boxes
+```
+
+The normalized document model is internal to `src/extractor.js`. It contains page dimensions, words, lines, text source, confidence, and bounding boxes. This gives every extractor the same search surface whether the source was embedded PDF text or OCR.
+
+Extraction is intentionally high precision. Field extractors look for labels and anchors, then inspect nearby text spatially instead of blindly matching across the whole document. Each candidate is scored using label strength, proximity, value validation, text/OCR confidence, and whether a highlight box can be found. Candidates below the configured confidence threshold are returned as missing so the UI shows `Needs review` instead of a likely wrong value.
+
+The rich normalized page graph is not persisted because it contains circular references used for extraction. The stored document keeps only the safe fields needed by the UI: page number, rendered image URL, dimensions, text source, extracted fields, line items, confidence, and highlights.
 
 ## Assumptions
 

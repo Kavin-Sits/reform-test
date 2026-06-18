@@ -134,11 +134,33 @@ function renderPages(doc) {
     const shell = document.createElement("div");
     shell.className = "page-shell";
     shell.dataset.page = page.page;
+    shell.style.aspectRatio = `${page.width} / ${page.height}`;
     shell.innerHTML = `<img src="${page.imageUrl}" alt="Page ${page.page}" />`;
     elements.pages.appendChild(shell);
   }
 
+  renderTextOverlays(doc);
   showHighlight(state.activeHighlight);
+}
+
+function renderTextOverlays(doc) {
+  for (const field of doc.fields || []) {
+    if (!field.value || !field.highlight) continue;
+
+    const page = document.querySelector(`.page-shell[data-page="${field.highlight.page}"]`);
+    const pageData = doc.pages.find((item) => item.page === field.highlight.page);
+    if (!page || !pageData) continue;
+    if (pageData.textSource !== "pdf-text") continue;
+
+    const overlay = document.createElement("div");
+    overlay.className = "text-overlay";
+    overlay.textContent = String(field.value);
+    overlay.style.left = `${(field.highlight.x / pageData.width) * 100}%`;
+    overlay.style.top = `${(field.highlight.y / pageData.height) * 100}%`;
+    overlay.style.width = `${(field.highlight.width / pageData.width) * 100}%`;
+    overlay.style.minHeight = `${(field.highlight.height / pageData.height) * 100}%`;
+    page.appendChild(overlay);
+  }
 }
 
 function renderFields(fields) {
@@ -208,7 +230,7 @@ function showHighlight(highlight) {
   marker.style.width = `${(highlight.width / pageData.width) * 100}%`;
   marker.style.height = `${(highlight.height / pageData.height) * 100}%`;
   page.appendChild(marker);
-  page.scrollIntoView({ behavior: "smooth", block: "center" });
+  marker.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
 }
 
 function setConfidence(node, value) {

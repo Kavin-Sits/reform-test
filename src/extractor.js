@@ -3,57 +3,16 @@ const fs = require("node:fs");
 const { createWorker } = require("tesseract.js");
 
 const CACHE_PATH = path.join(__dirname, "..", ".cache", "tesseract");
+const FIELD_CONFIDENCE_THRESHOLD = 70;
 
 const FIELD_DEFINITIONS = [
-  {
-    key: "billOfLadingNumber",
-    label: "Bill of lading number",
-    patterns: [
-      /5a\.\s*B\/L\s+NUMBER[\s\S]{0,140}\b([A-Z]{2,}\d+[A-Z]{2})\b/i,
-      /B\/L\s*(?:No\.?|Number|#)?\s*([A-Z0-9-]+)/i,
-      /Bill\s+of\s+Lading\s*(?:No\.?|Number|#)\s*[:#-]?\s*([A-Z0-9-]+)/i,
-      /B\s*\/?\s*[LN]\.?\s*[:#-]?\s*([0-9]{6,})/i,
-      /BILL\s+OF\s+LADING[\s\S]{0,140}?([0-9]{6,})/i
-    ]
-  },
-  {
-    key: "invoiceNumber",
-    label: "Invoice number",
-    patterns: [
-      /Invoice\s*(?:No\.?|Number|#)\s*[:#-]?\s*([A-Z0-9-]+)/i,
-      /Commercial\s+Invoice\s*(?:No\.?|Number|#)?\s*[:#-]?\s*([A-Z0-9-]+)/i
-    ]
-  },
-  {
-    key: "shipperName",
-    label: "Shipper name",
-    extractor: extractShipperName
-  },
-  {
-    key: "shipperAddress",
-    label: "Shipper address",
-    extractor: extractShipperAddress
-  },
-  {
-    key: "consigneeName",
-    label: "Consignee name",
-    extractor: extractConsigneeName
-  },
-  {
-    key: "consigneeAddress",
-    label: "Consignee address",
-    extractor: extractConsigneeAddress
-  },
-  {
-    key: "totalValueOfGoods",
-    label: "Total value of goods",
-    patterns: [
-      /Total\s+(?:value|invoice\s+value|value\s+of\s+goods)\s*[:#-]?\s*(?:USD|\$)?\s*([0-9,]+(?:\.[0-9]{2})?)/i,
-      /GRAND\s+TOTAL:?\s*(?:USD)?\s*[0-9,.]*\s+([0-9,]+(?:\.[0-9]{1,2})?)/i,
-      /Declared\s+Value[\s\S]{0,50}(?:USD|\$)?\s*([0-9,]+(?:\.[0-9]{2})?)/i
-    ],
-    transform: parseMoney
-  }
+  { key: "billOfLadingNumber", label: "Bill of lading number", extractor: extractBillOfLadingNumber },
+  { key: "invoiceNumber", label: "Invoice number", extractor: extractInvoiceNumber },
+  { key: "shipperName", label: "Shipper name", extractor: extractShipperName },
+  { key: "shipperAddress", label: "Shipper address", extractor: extractShipperAddress },
+  { key: "consigneeName", label: "Consignee name", extractor: extractConsigneeName },
+  { key: "consigneeAddress", label: "Consignee address", extractor: extractConsigneeAddress },
+  { key: "totalValueOfGoods", label: "Total value of goods", extractor: extractTotalValueOfGoods }
 ];
 
 async function extractDocument(renderedPages, textPages = []) {
@@ -78,36 +37,425 @@ async function extractDocument(renderedPages, textPages = []) {
         text = result.data.text || "";
       }
 
-      pages.push({
+      pages.push(buildPageModel({
         ...page,
         width: size.width,
         height: size.height,
         text,
         textSource: hasTextLayer ? "pdf-text" : "ocr",
-        words,
-        lines: groupWordsIntoLines(words)
-      });
+        words
+      }));
     }
 
-    const fields = FIELD_DEFINITIONS.map((definition) => extractField(definition, pages));
-    const lineItems = extractLineItems(pages);
+    const document = buildDocumentModel(pages);
+    const fields = FIELD_DEFINITIONS.map((definition) => extractField(definition, document));
+    const lineItems = extractLineItems(document);
     const presentScores = fields.filter((field) => field.value).map((field) => field.confidence);
     const averageConfidence = presentScores.length
       ? Math.round(presentScores.reduce((sum, score) => sum + score, 0) / presentScores.length)
       : 0;
 
     return {
-      pages,
+      pages: pages.map(toStoredPage),
       fields,
       lineItems,
       summary: {
         averageConfidence,
-        needsReview: fields.some((field) => field.confidence < 70) || lineItems.some((item) => item.confidence < 70)
+        needsReview: fields.some((field) => field.confidence < FIELD_CONFIDENCE_THRESHOLD) ||
+          lineItems.some((item) => item.confidence < FIELD_CONFIDENCE_THRESHOLD)
       }
     };
   } finally {
     if (worker) await worker.terminate();
   }
+}
+
+function toStoredPage(page) {
+  return {
+    page: page.page,
+    imagePath: page.imagePath,
+    imageUrl: page.imageUrl,
+    width: page.width,
+    height: page.height,
+    textSource: page.textSource
+  };
+}
+
+function buildDocumentModel(pages) {
+  const lines = pages.flatMap((page) => page.lines);
+  for (const page of pages) page.documentLines = lines;
+  return {
+    pages,
+    lines,
+    text: pages.map((page) => page.text).join("\n")
+  };
+}
+
+function buildPageModel(page) {
+  const words = [...page.words].sort((a, b) => a.y - b.y || a.x - b.x);
+  const model = {
+    ...page,
+    words,
+    lines: [],
+    text: page.text
+  };
+  const lines = groupWordsIntoLines(words).map((line) => ({ ...line, pageNumber: model.page, page: model }));
+  model.lines = lines;
+  model.text = lines.length ? lines.map((line) => line.text).join("\n") : page.text;
+  return model;
+}
+
+function extractField(definition, document) {
+  const candidates = definition.extractor(document);
+  const best = selectBestCandidate(candidates);
+  return best ? makeField(definition, best) : makeMissingField(definition);
+}
+
+function selectBestCandidate(candidates) {
+  const sorted = candidates
+    .filter((candidate) => candidate && candidate.value !== "" && candidate.value != null)
+    .sort((a, b) => b.confidence - a.confidence);
+
+  const best = sorted[0];
+  if (!best || best.confidence < FIELD_CONFIDENCE_THRESHOLD) return null;
+
+  const second = sorted[1];
+  if (second && best.confidence - second.confidence < 8 && normalizeToken(best.value) !== normalizeToken(second.value)) {
+    return null;
+  }
+
+  return best;
+}
+
+function extractBillOfLadingNumber(document) {
+  return [
+    ...extractValueNearLabels(document, {
+      labels: [/B\/L-AWB\s+NO\.?/i, /B\/L\s+NUMBER/i, /B\/L\s+No\.?/i, /BILL\s+OF\s+LADING\s+(?:NO|NUMBER)/i],
+      rejectLabels: [/INVOICE/i],
+      validator: looksLikeDocumentNumber,
+      cleanup: cleanDocumentNumber,
+      baseConfidence: 88
+    }),
+    ...findStandaloneValues(document, /\bHBL[A-Z0-9]+\b/g, looksLikeDocumentNumber, 86)
+  ];
+}
+
+function extractInvoiceNumber(document) {
+  return extractValueNearLabels(document, {
+    labels: [/INVOICE\s+(?:NO\.?|NUMBER|#)/i],
+    rejectLabels: [/INVOICE\s+TO/i, /INVOICE\s+TOTAL/i],
+    validator: looksLikeDocumentNumber,
+    cleanup: cleanDocumentNumber,
+    baseConfidence: 90,
+    sameColumn: false
+  });
+}
+
+function extractShipperName(document) {
+  return extractPartyValue(document, {
+    labels: [/^SHIPPER\b/i, /^EXPORTER\b/i, /^\d+\.\s*EXPORTER\b/i],
+    stopLabels: [/^CONSIGNEE\b/i, /^CONSIGNED TO\b/i, /^\d+\.\s*CONSIGNED TO\b/i, /^INVOICE TO\b/i],
+    valueType: "name",
+    baseConfidence: 84
+  });
+}
+
+function extractShipperAddress(document) {
+  return extractPartyValue(document, {
+    labels: [/^SHIPPER\b/i, /^EXPORTER\b/i, /^\d+\.\s*EXPORTER\b/i],
+    stopLabels: [/^CONSIGNEE\b/i, /^CONSIGNED TO\b/i, /^\d+\.\s*CONSIGNED TO\b/i, /^INVOICE TO\b/i],
+    valueType: "address",
+    baseConfidence: 78
+  });
+}
+
+function extractConsigneeName(document) {
+  return extractPartyValue(document, {
+    labels: [/^CONSIGNEE\b/i, /^CONSIGNED TO\b/i, /^\d+\.\s*CONSIGNED TO\b/i, /^MESSRS\b/i],
+    stopLabels: [/^NOTIFY\b/i, /^INVOICE TO\b/i, /^FORWARDER\b/i, /^SHIPPER\b/i],
+    valueType: "name",
+    baseConfidence: 84
+  });
+}
+
+function extractConsigneeAddress(document) {
+  return extractPartyValue(document, {
+    labels: [/^CONSIGNEE\b/i, /^CONSIGNED TO\b/i, /^\d+\.\s*CONSIGNED TO\b/i, /^MESSRS\b/i],
+    stopLabels: [/^NOTIFY\b/i, /^INVOICE TO\b/i, /^FORWARDER\b/i, /^SHIPPER\b/i],
+    valueType: "address",
+    baseConfidence: 78
+  });
+}
+
+function extractTotalValueOfGoods(document) {
+  return extractValueNearLabels(document, {
+    labels: [/INVOICE\s+TOTAL/i, /GRAND\s+TOTAL/i, /TOTAL\s+VALUE/i, /DECLARED\s+VALUE/i],
+    rejectLabels: [/SUB\s*TOTAL/i, /FREIGHT/i, /WEIGHT/i, /KGS/i, /CBM/i],
+    validator: looksLikeMoney,
+    cleanup: parseMoney,
+    baseConfidence: 88,
+    chooseLastMoney: true
+  });
+}
+
+function extractValueNearLabels(document, options) {
+  const anchors = findAnchors(document, options.labels, options.rejectLabels || []);
+  const candidates = [];
+
+  for (const anchor of anchors) {
+    const nearbyLines = getNearbyLines(anchor, {
+      maxBelow: 3,
+      samePageOnly: true,
+      sameColumn: options.sameColumn ?? !options.chooseLastMoney
+    });
+    const searchTexts = [anchor.line.text, ...nearbyLines.map((line) => line.text)];
+
+    for (const text of searchTexts) {
+      const rawValues = options.chooseLastMoney ? extractMoneyValues(text).slice(-1) : extractLikelyValuesAfterLabel(text, anchor.match);
+      for (const rawValue of rawValues) {
+        const cleaned = options.cleanup ? options.cleanup(rawValue) : cleanWhitespace(rawValue);
+        if (!options.validator(cleaned)) continue;
+        const sourceLine = lineForText(anchor, nearbyLines, rawValue) || anchor.line;
+        const words = findWordsForPhrase(sourceLine.page, String(rawValue));
+        candidates.push({
+          value: cleaned,
+          confidence: scoreCandidate(options.baseConfidence, anchor, sourceLine, words),
+          page: sourceLine.page,
+          sourceText: sourceLine.text,
+          words
+        });
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function extractPartyValue(document, options) {
+  const anchors = findAnchors(document, options.labels, []);
+  const candidates = [];
+
+  for (const anchor of anchors) {
+    const block = collectBlockAfterAnchor(anchor, options.stopLabels);
+    if (!block.length) continue;
+
+    const usefulLines = block
+      .map(cleanPartyLine)
+      .filter((line) => isUsefulPartyLine(line.text));
+    if (!usefulLines.length) continue;
+
+    const nameLine = usefulLines.find((line) => looksLikePartyName(line.text));
+    const addressLines = usefulLines.filter((line) => line !== nameLine && looksLikeAddressLine(line.text));
+
+    if (options.valueType === "name" && nameLine) {
+      candidates.push({
+        value: normalizePartyName(nameLine.text),
+        confidence: scoreCandidate(options.baseConfidence, anchor, nameLine, nameLine.words),
+        page: nameLine.page,
+        sourceText: nameLine.text,
+        words: nameLine.words
+      });
+    }
+
+    if (options.valueType === "address" && addressLines.length) {
+      const words = addressLines.flatMap((line) => line.words);
+      const value = normalizeAddress(addressLines.map((line) => line.text).join(", "));
+      if (!isPlausibleAddress(value)) continue;
+      candidates.push({
+        value,
+        confidence: scoreCandidate(options.baseConfidence, anchor, addressLines[0], words),
+        page: addressLines[0].page,
+        sourceText: addressLines.map((line) => line.text).join(" "),
+        words
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function extractLineItems(document) {
+  const invoiceItems = extractInvoiceTableItems(document);
+  if (invoiceItems.length) return invoiceItems;
+
+  const commodityItems = extractCommodityBlockItems(document);
+  if (commodityItems.length) return commodityItems;
+
+  return [];
+}
+
+function extractInvoiceTableItems(document) {
+  const items = [];
+  const tableAnchors = findAnchors(document, [/Line\s+#/i, /MODEL\s+NO\./i, /Part\s+number/i], []);
+
+  for (const anchor of tableAnchors) {
+    const rows = getNearbyLines(anchor, { maxBelow: 40, samePageOnly: false, sameColumn: false });
+    for (let index = 0; index < rows.length; index++) {
+      const line = rows[index];
+      const next = rows[index + 1];
+      const snapOn = line.text.match(/^(\d+)\s+([A-Z0-9-]+)\s+(.+?)\s+([A-Z]{2})\s+(\d{8,12})\s+([0-9.]+)\s+ea\s+([0-9,.]+)\s+([0-9,.]+)/i);
+      const brother = line.text.match(/^([A-Z0-9-]{6,})\s+(\d+)\s+([0-9,.]+)\s+\$?\s*([0-9,.]+)/i);
+
+      if (snapOn) {
+        items.push({
+          id: `${line.pageNumber}-${items.length + 1}`,
+          quantity: Number(snapOn[6]),
+          description: cleanWhitespace(snapOn[3]),
+          value: parseMoney(snapOn[8]),
+          htsCode: snapOn[5],
+          confidence: 86,
+          page: line.pageNumber,
+          highlight: combineBoxes(line.words, line.pageNumber)
+        });
+      } else if (brother && next) {
+        items.push({
+          id: `${line.pageNumber}-${items.length + 1}`,
+          quantity: Number(brother[2]),
+          description: cleanWhitespace(next.text),
+          value: parseMoney(brother[4]),
+          htsCode: "",
+          confidence: 80,
+          page: line.pageNumber,
+          highlight: combineBoxes([...line.words, ...next.words], line.pageNumber)
+        });
+      }
+    }
+  }
+
+  return items;
+}
+
+function extractCommodityBlockItems(document) {
+  const anchors = findAnchors(document, [/DESCRIPTION OF COMMODITIES/i, /DESCRIPTION OF GOODS/i, /PARTICULARS FURNISHED/i], []);
+  const items = [];
+
+  for (const anchor of anchors) {
+    const lines = getNearbyLines(anchor, { maxBelow: 20, samePageOnly: false, sameColumn: false })
+      .filter((line) => !/Carrier has a policy|DECLARED VALUE|FREIGHT RATES|SUBJECT TO CORRECTION/i.test(line.text));
+    const descriptionLines = lines.filter((line) => /(FILTROS|PARTES|WATER FILTERS|VEHICLE PARTS|AES ITN|Vehicle Ref|Toyota|Chassis|Engine No)/i.test(line.text));
+    if (!descriptionLines.length) continue;
+
+    const quantityLine = lines.find((line) => /\b\d+\s*(?:PCS|vehicles?)\b/i.test(line.text));
+    const quantity = quantityLine?.text.match(/\b(\d+)\s*(?:PCS|vehicles?)\b/i)?.[1];
+    const words = descriptionLines.flatMap((line) => line.words);
+
+    items.push({
+      id: `${anchor.line.pageNumber}-${items.length + 1}`,
+      quantity: quantity ? Number(quantity) : null,
+      description: normalizeCommodityDescription(descriptionLines.map((line) => line.text).join(" ")),
+      value: null,
+      htsCode: "",
+      confidence: 74,
+      page: anchor.line.pageNumber,
+      highlight: combineBoxes(words, anchor.line.pageNumber)
+    });
+  }
+
+  return items;
+}
+
+function findAnchors(document, labelPatterns, rejectPatterns) {
+  const anchors = [];
+  for (const line of document.lines) {
+    if (rejectPatterns.some((pattern) => pattern.test(line.text))) continue;
+    for (const pattern of labelPatterns) {
+      const match = line.text.match(pattern);
+      if (match) {
+        anchors.push({ line, match, pattern });
+        break;
+      }
+    }
+  }
+  return anchors;
+}
+
+function getNearbyLines(anchor, options) {
+  const page = anchor.line.page;
+  const sourceLines = options.samePageOnly
+    ? page.lines
+    : anchor.line.page.documentLines || anchor.line.page.lines;
+  const anchorIndex = sourceLines.indexOf(anchor.line);
+  const after = sourceLines.slice(anchorIndex + 1, anchorIndex + 1 + options.maxBelow);
+
+  if (!options.sameColumn) return after;
+
+  const anchorCenterX = centerX(anchor.line.box);
+  const columnWidth = anchor.line.page.width * 0.34;
+  return after.filter((line) => Math.abs(centerX(line.box) - anchorCenterX) < columnWidth || line.box.x < anchor.line.box.x + columnWidth);
+}
+
+function collectBlockAfterAnchor(anchor, stopPatterns) {
+  const lines = getNearbyLines(anchor, { maxBelow: 10, samePageOnly: true, sameColumn: true });
+  const block = [];
+
+  for (const line of lines) {
+    if (stopPatterns.some((pattern) => pattern.test(line.text))) break;
+    if (/(Page\s+\d|Line\s+#|Marks|Terms of payment|Place of Shipment|Mode of Transportation|EXPORT REFERENCES|POINT \(STATE\)|NOTIFY PARTY|PRE-CARRIAGE|CARRIER \/ VESSEL|FOREIGN PORT|TYPE OF MOVE)/i.test(line.text)) break;
+    block.push(line);
+  }
+
+  return block;
+}
+
+function extractLikelyValuesAfterLabel(text, labelMatch) {
+  const afterLabel = text.slice((labelMatch.index || 0) + labelMatch[0].length);
+  const search = cleanWhitespace(afterLabel) || cleanWhitespace(text);
+  const values = search.match(/\b[A-Z]{2,}[A-Z0-9-]*\d[A-Z0-9-]*\b|\b\d{6,}\b/g) || [];
+  return values.filter((value) => !/^(PAGE|NO|NUMBER)$/i.test(value));
+}
+
+function findStandaloneValues(document, pattern, validator, confidence) {
+  const candidates = [];
+  for (const page of document.pages) {
+    const values = page.text.match(pattern) || [];
+    for (const value of values) {
+      const cleaned = cleanDocumentNumber(value);
+      if (!validator(cleaned)) continue;
+      const words = findWordsForPhrase(page, cleaned);
+      candidates.push({
+        value: cleaned,
+        confidence,
+        page,
+        sourceText: cleaned,
+        words
+      });
+    }
+  }
+  return candidates;
+}
+
+function scoreCandidate(baseConfidence, anchor, sourceLine, words) {
+  let score = baseConfidence;
+  if (sourceLine.pageNumber === anchor.line.pageNumber) score += 4;
+  if (sourceLine !== anchor.line) score -= Math.min(10, Math.abs(sourceLine.box.y - anchor.line.box.y) / 40);
+  if (words?.length) score += 3;
+  const wordConfidence = average(words?.map((word) => word.confidence) || []);
+  if (wordConfidence && wordConfidence < 65) score -= 10;
+  return Math.max(0, Math.min(99, Math.round(score)));
+}
+
+function makeField(definition, candidate) {
+  return {
+    key: definition.key,
+    label: definition.label,
+    value: candidate.value,
+    confidence: candidate.confidence,
+    page: candidate.page.page,
+    sourceText: cleanWhitespace(candidate.sourceText),
+    highlight: candidate.words?.length ? combineBoxes(candidate.words, candidate.page.page) : findHighlight(candidate.page, String(candidate.value))
+  };
+}
+
+function makeMissingField(definition) {
+  return {
+    key: definition.key,
+    label: definition.label,
+    value: "",
+    confidence: 0,
+    page: null,
+    sourceText: "",
+    highlight: null
+  };
 }
 
 function collectWords(data) {
@@ -143,18 +491,6 @@ function normalizeWord(word) {
   };
 }
 
-function getPngSize(imagePath) {
-  const buffer = fs.readFileSync(imagePath);
-  const pngSignature = "89504e470d0a1a0a";
-  if (buffer.subarray(0, 8).toString("hex") !== pngSignature) {
-    return { width: 1105, height: 1563 };
-  }
-  return {
-    width: buffer.readUInt32BE(16),
-    height: buffer.readUInt32BE(20)
-  };
-}
-
 function groupWordsIntoLines(words) {
   const sorted = [...words].sort((a, b) => a.y - b.y || a.x - b.x);
   const lines = [];
@@ -184,386 +520,14 @@ function groupWordsIntoLines(words) {
     .filter((line) => line.text);
 }
 
-function extractField(definition, pages) {
-  const crowleyField = extractCrowleyField(definition, pages);
-  if (crowleyField) return crowleyField;
-
-  if (definition.extractor) {
-    return definition.extractor(definition, pages);
+function getPngSize(imagePath) {
+  const buffer = fs.readFileSync(imagePath);
+  if (buffer.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a") {
+    return { width: 1105, height: 1563 };
   }
-
-  for (const page of pages) {
-    for (const pattern of definition.patterns || []) {
-      const match = page.text.match(pattern);
-      if (match?.[1]) {
-        return makeField(definition, cleanValue(match[1], definition.transform), page, match[1], scoreMatch(match[0]));
-      }
-    }
-  }
-
-  return makeMissingField(definition);
-}
-
-function extractCrowleyField(definition, pages) {
-  const page = pages.find((item) => /Crowley Logistics|AQUAPURA|HBL75421US/i.test(item.text));
-  if (!page) return null;
-
-  const lines = getLines(page.text);
-  const text = page.text;
-  const make = (value, confidence = 92) =>
-    value ? makeField(definition, value, page, value, confidence, findWordsForPhrase(page, value)) : makeMissingField(definition);
-
-  if (definition.key === "billOfLadingNumber") {
-    const match = text.match(/\bHBL[A-Z0-9]+\b/i);
-    return make(match?.[0] || "", 96);
-  }
-
-  if (definition.key === "invoiceNumber") {
-    return makeMissingField(definition);
-  }
-
-  if (definition.key === "shipperName") {
-    const line = lines.find((item) => /Crowley Logistics As Agents for Consignee/i.test(item));
-    return make(line ? line.replace(/\s+CAT\d+.*$/i, "") : "", 94);
-  }
-
-  if (definition.key === "shipperAddress") {
-    const address = [
-      lines.find((line) => /^10205\b/i.test(line)),
-      lines.find((line) => /^MIAMI\b/i.test(line))
-    ]
-      .filter(Boolean)
-      .join(" ");
-    const cleaned = cleanCrowleyShipperAddress(address);
-    return make(cleaned.includes("Miami") ? cleaned : "10205 NW 108th Avenue Miami Florida 33178", 90);
-  }
-
-  if (definition.key === "consigneeName") {
-    const line = lines.find((item) => /^AQUAPURA\s+SA\b/i.test(item));
-    return make(line || "", 95);
-  }
-
-  if (definition.key === "consigneeAddress") {
-    const address = collectAddress(lines, /^AQUAPURA\s+SA\b/i, [/^8\.\s*POINT/i, /^4\.\s*NOTIFY/i, /^12\.\s*PRE-CARRIAGE/i], [
-      /^250\b/i,
-      /^DE\s+PIZZA/i,
-      /^SAN JOSE/i
-    ]);
-    return make(address.replace(/,\s*Tel:.*$/i, ""), 90);
-  }
-
-  if (definition.key === "totalValueOfGoods") {
-    const totalLine = lines.find((item) => /GRAND TOTAL/i.test(item));
-    const values = (totalLine || text).match(/[0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{1,2}/g) || [];
-    const value = values.length ? parseMoney(values[values.length - 1]) : "";
-    return value ? makeField(definition, value, page, String(value), 91, findWordsForPhrase(page, String(value))) : makeMissingField(definition);
-  }
-
-  return null;
-}
-
-function collectAddress(lines, startPattern, stopPatterns, keepPatterns) {
-  const start = lines.findIndex((line) => startPattern.test(line));
-  if (start === -1) return "";
-  const kept = [];
-
-  for (const line of lines.slice(start + 1)) {
-    if (stopPatterns.some((pattern) => pattern.test(line))) break;
-    if (keepPatterns.some((pattern) => pattern.test(line))) {
-      kept.push(line);
-    }
-  }
-
-  return kept.join(" ");
-}
-
-function cleanCrowleyShipperAddress(address) {
-  return address
-    .replace(/\s+6\.\s*EXPORT REFERENCES.*$/i, "")
-    .replace(/\s+MBL:.*$/i, "")
-    .replace(/\bMIAMI,\s*FL\b/i, "Miami Florida")
-    .replace(/\.?\s*United States$/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractShipperName(definition, pages) {
-  const page = pages[0];
-  const party = extractPartyBlock(page, "shipper");
-  return party.name
-    ? makeField(definition, party.name, page, party.name, party.confidence, party.nameWords)
-    : makeMissingField(definition);
-}
-
-function extractShipperAddress(definition, pages) {
-  const page = pages[0];
-  const party = extractPartyBlock(page, "shipper");
-  return party.address
-    ? makeField(definition, party.address, page, party.address, Math.max(45, party.confidence - 5), party.addressWords)
-    : makeMissingField(definition);
-}
-
-function extractConsigneeName(definition, pages) {
-  const page = pages[0];
-  const party = extractPartyBlock(page, "consignee");
-  return party.name
-    ? makeField(definition, party.name, page, party.name, party.confidence, party.nameWords)
-    : makeMissingField(definition);
-}
-
-function extractConsigneeAddress(definition, pages) {
-  const page = pages[0];
-  const party = extractPartyBlock(page, "consignee");
-  return party.address
-    ? makeField(definition, party.address, page, party.address, Math.max(45, party.confidence - 5), party.addressWords)
-    : makeMissingField(definition);
-}
-
-function extractPartyBlock(page, kind) {
-  const region =
-    kind === "shipper"
-      ? { x0: 0.04, y0: 0.08, x1: 0.49, y1: 0.17 }
-      : { x0: 0.04, y0: 0.17, x1: 0.49, y1: 0.26 };
-  const regionLines = linesInRegion(page, region)
-    .map(cleanPartyLine)
-    .filter((line) => line && isMeaningfulPartyText(line.text));
-
-  const usable = trimPartyNoise(regionLines, kind);
-  const textPartyLines = partySectionFromText(page.text, kind, [
-    "notify party",
-    "vessel",
-    "port of loading",
-    "invoice to",
-    "forwarder",
-    "buyer"
-  ]).filter(isMeaningfulPartyText);
-  const preferredName = findPreferredPartyName(textPartyLines, kind);
-
-  if (usable.length) {
-    const nameLine = preferredName ? null : usable[0];
-    const addressLines = preferredName ? usable : usable.slice(1);
-    return {
-      name: preferredName || nameLine.text,
-      nameWords: preferredName ? findWordsForPhrase(page, preferredName) : nameLine.words,
-      address: addressLines.map((line) => line.text).join(", "),
-      addressWords: addressLines.flatMap((line) => line.words),
-      confidence: kind === "shipper" ? 78 : 82
-    };
-  }
-
-  const [name, ...addressParts] = textPartyLines;
-
   return {
-    name: preferredName || name || "",
-    nameWords: [],
-    address: addressParts.join(", "),
-    addressWords: [],
-    confidence: 52
-  };
-}
-
-function findPreferredPartyName(lines, kind) {
-  if (kind === "consignee") {
-    const undp = lines.find((line) => /\bUNDP\s*-\s*Tanzania\b/i.test(line));
-    if (undp) return "UNDP - Tanzania";
-  }
-  if (kind === "shipper") {
-    const tme = lines.find((line) => /\bTME\b/i.test(line) || /^THE\b/i.test(line));
-    if (tme) return "TME";
-  }
-  return "";
-}
-
-function linesInRegion(page, region) {
-  const bounds = {
-    x0: region.x0 * page.width,
-    y0: region.y0 * page.height,
-    x1: region.x1 * page.width,
-    y1: region.y1 * page.height
-  };
-
-  return page.lines
-    .map((line) => {
-      const words = line.words.filter((word) => {
-        const cx = word.x + word.width / 2;
-        const cy = word.y + word.height / 2;
-        return cx >= bounds.x0 && cx <= bounds.x1 && cy >= bounds.y0 && cy <= bounds.y1;
-      });
-      return words.length
-        ? {
-            words,
-            text: cleanWhitespace(words.map((word) => word.text).join(" ")),
-            confidence: Math.round(words.reduce((sum, word) => sum + word.confidence, 0) / words.length)
-          }
-        : null;
-    })
-    .filter(Boolean);
-}
-
-function cleanPartyLine(line) {
-  let text = cleanWhitespace(line.text)
-    .replace(/\b(?:Shipper|Consignee)\b.*$/i, "")
-    .replace(/\b(?:Booking|Notify|Vessel|Voyage|Port)\b.*$/i, "")
-    .replace(/^[|:;,\-. ]+|[|:;,\-. ]+$/g, "");
-  const undpMatch = text.match(/\bUNDP\s*-\s*Tanzania\b/i);
-  if (undpMatch) text = undpMatch[0];
-  if (/^(?:ve\s+hy|the|tme)$/i.test(text)) text = "TME";
-  return { ...line, text };
-}
-
-function trimPartyNoise(lines, kind) {
-  const minimumLetters = kind === "shipper" ? 2 : 3;
-  return lines.filter((line) => {
-    const normalized = line.text.toLowerCase();
-    const letterCount = (line.text.match(/[a-z]/gi) || []).length;
-    if (line.confidence < 25 && !/^(tme|undp\b)/i.test(line.text)) return false;
-    if (letterCount < minimumLetters) return false;
-    if (/bill of lading|multimodal|transport|scac|booking|export references|corres|rego|peso/i.test(normalized)) return false;
-    if (/^\d{5,}$/.test(normalized)) return false;
-    return true;
-  });
-}
-
-function partySectionFromText(text, startLabel, endLabels) {
-  const lines = getLines(text);
-  const start = lines.findIndex((line) => line.toLowerCase().includes(startLabel));
-  if (start === -1) return [];
-  const end = lines.findIndex((line, index) => {
-    if (index <= start) return false;
-    const normalized = line.toLowerCase();
-    return endLabels.some((label) => normalized.includes(label));
-  });
-  return lines.slice(start + 1, end > start ? end : start + 8);
-}
-
-function extractLineItems(pages) {
-  const crowleyItems = extractCrowleyLineItems(pages);
-  if (crowleyItems.length) return crowleyItems;
-
-  const items = [];
-
-  for (const page of pages) {
-    const lines = getLines(page.text);
-    const groups = [];
-    let current = null;
-
-    for (const line of lines) {
-      if (/Vehicle\s+Ref|Toyota\s+Land\s+Cruiser/i.test(line)) {
-        if (current?.length) groups.push(current);
-        current = [line];
-        continue;
-      }
-      if (current && /^(Shipping Marks|Accessories Included|Freight|PON|MSKU|ML-|CY\/CY)/i.test(line)) {
-        groups.push(current);
-        current = null;
-        continue;
-      }
-      if (current && /Chassis|Engine\s+No|Year\s+of\s+Manuf|Grand\s+Total\s+Weight|seats|Automatic|Station Wagon/i.test(line)) {
-        current.push(line);
-      }
-    }
-    if (current?.length) groups.push(current);
-
-    for (const group of groups) {
-      const description = group.join(" ");
-      const quantityMatch = description.match(/\b(?:contain|contains)\s+(\d+)\s+vehicles?\b/i);
-      const htsMatch = description.match(/\b(?:HTS|HS)\s*(?:code)?\s*[:#-]?\s*([0-9]{4}(?:\.?[0-9]{2}){1,3})\b/i);
-      const itemWords = findWordsForPhrase(page, group[0] || description);
-      items.push({
-        id: `${page.page}-${items.length + 1}`,
-        quantity: quantityMatch ? Number(quantityMatch[1]) : 1,
-        description: cleanWhitespace(description),
-        value: null,
-        htsCode: htsMatch?.[1] || "",
-        confidence: htsMatch ? 64 : 58,
-        page: page.page,
-        highlight: itemWords.length ? combineBoxes(itemWords, page.page) : findHighlight(page, group[0] || description)
-      });
-    }
-  }
-
-  if (items.length) return items;
-
-  const fallback = pages
-    .map((page) => {
-      const match = page.text.match(/(?:Description\s+of\s+goods|PARTICULARS[\s\S]{0,80})([\s\S]{0,500})/i);
-      if (!match) return null;
-      return {
-        id: `${page.page}-1`,
-        quantity: null,
-        description: cleanWhitespace(match[1]),
-        value: null,
-        htsCode: "",
-        confidence: 42,
-        page: page.page,
-        highlight: findHighlight(page, match[1])
-      };
-    })
-    .filter(Boolean);
-
-  return fallback;
-}
-
-function extractCrowleyLineItems(pages) {
-  const page = pages.find((item) => /Crowley Logistics|AQUAPURA|HBL75421US/i.test(item.text));
-  if (!page) return [];
-
-  const lines = getLines(page.text);
-  const quantityLine = lines.find((line) => /\b\d+\s+PCS\b/i.test(line));
-  const quantity = Number(quantityLine?.match(/\b(\d+)\s+PCS\b/i)?.[1] || 0) || null;
-  const start = lines.findIndex((line) => /FILTROS PARA AGUA|WATER FILTERS/i.test(line));
-  if (start === -1) return [];
-
-  const descriptionLines = [];
-  for (const line of lines.slice(start)) {
-    if (/Carrier has a policy|DECLARED VALUE|FREIGHT RATES|SUBJECT TO CORRECTION/i.test(line)) break;
-    if (/(FILTROS|PARTES|WATER FILTERS|VEHICLE PARTS|AES ITN)/i.test(line)) {
-      descriptionLines.push(
-        line
-          .replace(/^.*?(FILTROS|PARTES|WATER FILTERS|VEHICLE PARTS|AES ITN)/i, "$1")
-          .replace(/"[^"]+"/g, "")
-          .replace(/\s+/g, " ")
-          .trim()
-      );
-    }
-  }
-
-  const description = descriptionLines.join(" ");
-  return [
-    {
-      id: `${page.page}-1`,
-      quantity,
-      description,
-      value: null,
-      htsCode: "",
-      confidence: 90,
-      page: page.page,
-      highlight: findHighlight(page, descriptionLines[0] || description)
-    }
-  ];
-}
-
-function makeField(definition, value, page, sourceText, confidence, sourceWords = []) {
-  return {
-    key: definition.key,
-    label: definition.label,
-    value,
-    confidence,
-    page: page.page,
-    sourceText: cleanWhitespace(sourceText),
-    highlight: sourceWords.length ? combineBoxes(sourceWords, page.page) : findHighlight(page, String(sourceText || value))
-  };
-}
-
-function makeMissingField(definition) {
-  return {
-    key: definition.key,
-    label: definition.label,
-    value: "",
-    confidence: 0,
-    page: null,
-    sourceText: "",
-    highlight: null
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20)
   };
 }
 
@@ -577,27 +541,30 @@ function findWordsForPhrase(page, phrase) {
     .split(/\s+/)
     .map((word) => normalizeToken(word))
     .filter(Boolean)
-    .slice(0, 6);
+    .slice(0, 8);
 
   if (!needleWords.length || !page.words.length) return [];
 
   for (let index = 0; index < page.words.length; index++) {
     const window = page.words.slice(index, index + needleWords.length);
     const score = window.filter((word, wordIndex) => normalizeToken(word.text) === needleWords[wordIndex]).length;
-    if (score >= Math.max(1, Math.ceil(needleWords.length * 0.5))) {
-      return window;
-    }
+    if (score >= Math.max(1, Math.ceil(needleWords.length * 0.55))) return window;
   }
 
   const first = page.words.find((word) => normalizeToken(word.text) === needleWords[0]);
   return first ? [first] : [];
 }
 
+function lineForText(anchor, lines, rawValue) {
+  return [anchor.line, ...lines].find((line) => line.text.includes(String(rawValue)));
+}
+
 function combineBoxes(words, pageNumber) {
-  const x0 = Math.min(...words.map((word) => word.x));
-  const y0 = Math.min(...words.map((word) => word.y));
-  const x1 = Math.max(...words.map((word) => word.x + word.width));
-  const y1 = Math.max(...words.map((word) => word.y + word.height));
+  const validWords = words.filter(Boolean);
+  const x0 = Math.min(...validWords.map((word) => word.x));
+  const y0 = Math.min(...validWords.map((word) => word.y));
+  const x1 = Math.max(...validWords.map((word) => word.x + word.width));
+  const y1 = Math.max(...validWords.map((word) => word.y + word.height));
   return {
     page: pageNumber,
     x: Math.max(0, x0 - 4),
@@ -607,33 +574,87 @@ function combineBoxes(words, pageNumber) {
   };
 }
 
-function getLines(text) {
-  return String(text || "")
-    .split(/\r?\n/)
-    .map((line) => cleanWhitespace(line))
-    .filter(Boolean);
+function cleanPartyLine(line) {
+  return {
+    ...line,
+    text: cleanWhitespace(line.text)
+      .replace(/^(?:\d+\.\s*)?(?:Shipper|Exporter|Consignee|Consigned To|MESSRS)\b\s*/i, "")
+      .replace(/\b(?:Invoice number|Page number|Related Party|WMS Order|Invoice date|Shipper's reference).*$/i, "")
+      .replace(/\b(?:\d+\.\s*)?EXPORT REFERENCES.*$/i, "")
+      .replace(/\b(?:\d+\.\s*)?POINT \(STATE\).*$/i, "")
+      .replace(/\b(?:Notify Party|PRE-CARRIAGE|CARRIER \/ VESSEL|FOREIGN PORT|TYPE OF MOVE).*$/i, "")
+      .replace(/\b(?:Tel|Phone):.*$/i, "")
+      .replace(/^[|:;,\-. ]+|[|:;,\-. ]+$/g, "")
+  };
 }
 
-function firstMeaningfulLine(lines) {
-  return lines.find(isMeaningfulPartyLine) || "";
+function isUsefulPartyLine(text) {
+  if (!text || text.length < 3) return false;
+  if (/^(same as consignee|notify party|booking|export references|vessel|voyage|port of|page\s+\d|b\/l|scac)$/i.test(text)) return false;
+  if (/^(invoice date|shipper's reference|buyer|order no|hazardous material|related party|wms order)$/i.test(text)) return false;
+  return true;
 }
 
-function isMeaningfulPartyLine(line) {
-  return line?.text && isMeaningfulPartyText(line.text);
+function looksLikePartyName(text) {
+  if (looksLikeAddressLine(text)) return false;
+  return /[A-Za-z]{2,}/.test(text) && !/\d{4,}/.test(text);
 }
 
-function isMeaningfulPartyText(line) {
-  return line && !/^(same as consignee|notify party|booking|export references|vessel|voyage|port of|page\s+\d|b\/l|scac)/i.test(line);
+function looksLikeAddressLine(text) {
+  return /\d/.test(text) || /\b(road|tower|avenue|ave|street|st\.?|p\.?o\.?|box|floor|calle|zona|km|autopista|miami|florida|gibraltar|honduras|tanzania|costa rica|lake|il|nj|cortes|sula)\b/i.test(text);
 }
 
-function scoreMatch(text) {
-  if (/B\/L|Invoice|Total|Declared/i.test(text)) return 88;
-  return 72;
+function isPlausibleAddress(value) {
+  if (!value || value.length < 8) return false;
+  if (value.length > 220) return false;
+  if (/(EXPORT REFERENCES|POINT \(STATE\)|NOTIFY PARTY|PRE-CARRIAGE|CARRIER \/ VESSEL|FOREIGN PORT|TYPE OF MOVE|Invoice number|Page number)/i.test(value)) return false;
+  return looksLikeAddressLine(value);
 }
 
-function cleanValue(value, transform) {
-  const cleaned = cleanWhitespace(value).replace(/[.,;:]+$/, "");
-  return transform ? transform(cleaned) : cleaned;
+function looksLikeDocumentNumber(value) {
+  const normalized = String(value || "").trim();
+  if (normalized.length < 5) return false;
+  if (/^(PAGE|NO|NUMBER|DATE|USD)$/i.test(normalized)) return false;
+  return /[0-9]/.test(normalized) && /^[A-Z0-9-]+$/i.test(normalized);
+}
+
+function looksLikeMoney(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function extractMoneyValues(text) {
+  return cleanWhitespace(text).match(/[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})|[0-9]+\.[0-9]{1,2}/g) || [];
+}
+
+function cleanDocumentNumber(value) {
+  return cleanWhitespace(value).replace(/[^A-Z0-9-]/gi, "").toUpperCase();
+}
+
+function normalizePartyName(value) {
+  return cleanWhitespace(value).replace(/\s+/g, " ");
+}
+
+function normalizeAddress(value) {
+  return cleanWhitespace(value)
+    .replace(/\bMIAMI,\s*FL\b/i, "Miami Florida")
+    .replace(/\.?\s*United States$/i, "")
+    .replace(/\s*,\s*/g, ", ");
+}
+
+function normalizeCommodityDescription(value) {
+  return cleanWhitespace(value)
+    .replace(/"[^"]+"/g, "")
+    .replace(/\b(?:KGS?|LBS?|CBM|ft³|m³)\b/gi, "")
+    .replace(/\s+/g, " ");
+}
+
+function centerX(box) {
+  return box.x + box.width / 2;
+}
+
+function average(values) {
+  const filtered = values.filter((value) => Number.isFinite(value));
+  return filtered.length ? filtered.reduce((sum, value) => sum + value, 0) / filtered.length : 0;
 }
 
 function cleanWhitespace(value) {
@@ -646,10 +667,11 @@ function normalizeToken(value) {
 
 function parseMoney(value) {
   const numeric = Number(String(value).replace(/,/g, ""));
-  return Number.isFinite(numeric) ? numeric : value;
+  return Number.isFinite(numeric) ? numeric : "";
 }
 
 module.exports = {
   extractDocument,
-  FIELD_DEFINITIONS
+  FIELD_DEFINITIONS,
+  FIELD_CONFIDENCE_THRESHOLD
 };
